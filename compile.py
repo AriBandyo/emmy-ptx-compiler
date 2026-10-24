@@ -122,14 +122,24 @@ for i, op in enumerate(tile.body):
         print("Operation:", op.op.name, file=sys.stderr)
         print("Arguments:", op.args, file=sys.stderr)
         value_regs[op.name] = f"%f{len(value_regs)}"
-        left_reg = value_regs[op.args[0]]
-        right_reg = value_regs[op.args[1]]
+
+        #condition for ReLU or else  op.args[1] when ReLU is applied will faile 
         dest_reg = value_regs[op.name]
-        print("PTX operands:", dest_reg, left_reg, right_reg, file=sys.stderr)
-        ptx_opcode = ptx_float_opcodes[op.op.name]
+        if op.op.name == "relu":
+            src_reg = value_regs[op.args[0]]
+            instruction = (
+                f"max.f32 {dest_reg}, {src_reg},0f00000000;"
+            )
+        else:
 
-        instruction = f"{ptx_opcode} {dest_reg}, {left_reg}, {right_reg};"
-
+            left_reg = value_regs[op.args[0]]
+            right_reg = value_regs[op.args[1]]
+            ptx_opcode = ptx_float_opcodes[op.op.name]
+            instruction = (
+                f"{ptx_opcode} {dest_reg}, "
+                f"{left_reg}, {right_reg};"
+            )
+        print("Generated PTX:", instruction, file=sys.stderr)
         arithmetic_instructions.append(instruction)
         body_instructions.append(instruction)
     elif type(op).__name__ == "Write":
