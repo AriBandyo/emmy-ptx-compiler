@@ -65,6 +65,7 @@ arg_order = kernel_meta["arg_order"]
 
 pointer_instructions = []
 body_instructions = []
+shared_declarations = []
 
 for j, arg_name in enumerate(arg_order):
     pointer_instructions.append(
@@ -75,8 +76,70 @@ for j, arg_name in enumerate(arg_order):
         f"cvta.to.global.u64 %rd_base{j}, %rd_param{j};"
     )
 for i, op in enumerate(tile.body):
+
+    
+
     arg_order = kernel_meta["arg_order"]
-    if type(op).__name__ == "Load":
+    if type(op).__name__ == "StridedLoop":
+
+        # Initialize reduction accumulators
+        for inner in op.body:
+            if type(inner).__name__ == "Accum":
+                if inner.op.name != "add":
+                    raise NotImplementedError(
+                        f"Unsupported accumulator: {inner.op.name}"
+                    )
+
+                acc_reg = f"%f{len(value_regs)}"
+                value_regs[inner.name] = acc_reg
+
+                body_instructions.append(
+                    f"mov.f32 {acc_reg}, 0f00000000;"
+                )
+
+        start_reg = f"%r_{op.start.name}"
+        loop_reg = f"%r_{op.axis.name}"
+        loop_limit = op.axis.extent.as_static()
+        loop_step = op.step.value
+        body_instructions.extend([
+            f"mov.u32 {loop_reg}, {start_reg};",
+            f"LOOP_{i}:",
+            f"setp.ge.u32 %p_loop, {loop_reg}, {loop_limit};",
+            f"@%p_loop bra LOOP_END_{i};"
+        ])
+        for inner in op.body:
+            if type(inner).__name__ == "Load":
+                dest_reg = f"%f{len(value_regs)}"
+                value_regs[inner.names[0]] = dest_reg
+
+                param_index = arg_order.index(inner.input)
+                index_reg = compiler_expr(inner.index[0])
+
+                body_instructions.extend([
+                    f"mul.wide.u32 %rd_offset{i}, {index_reg}, {inner.dtype.nbytes};",
+                    f"add.u64 %rd_addr{i}, %rd_base{param_index}, %rd_offset{i};",
+                    f"ld.global.f32 {dest_reg}, [%rd_addr{i}];"
+                ])
+            
+            elif type(inner).__name__ == "Accum":
+                acc_reg = value_regs[inner.name]
+                src_reg = value_regs[inner.value]
+
+                instruction = (
+                    f"add.f32 {acc_reg}, {acc_reg}, {src_reg};"
+                )
+
+                body_instructions.append(instruction)
+
+
+        # Move to the next element
+        body_instructions.extend([
+            f"add.u32 {loop_reg}, {loop_reg}, {loop_step};",
+            f"bra LOOP_{i};",
+            f"LOOP_END_{i}:"
+        ])
+
+    elif type(op).__name__ == "Load":
         print("Load found at:", i, file=sys.stderr)
         print("Variable:",op.names[0], file=sys.stderr)
         print("Source",op.input, file=sys.stderr)
@@ -177,6 +240,195 @@ for i, op in enumerate(tile.body):
 
         print("Output registers:", output_regs, file=sys.stderr)
         print("Output parameter:", output_param, file=sys.stderr)
+
+    
+    elif type(op).__name__ == "WarpShuffle":
+        if len(op.state) != 1 or len(op.state_b) != 1:
+            raise NotImplementedError(
+                "Multiple shuffle states not supported yet"
+            )
+
+        combine = op.combine_states[0]
+        if combine.op.name != "add":
+            raise NotImplementedError(
+                f"Unsupported shuffle operation: {combine.op.name}"
+            )
+
+        acc_reg = value_regs[op.state[0]]
+
+        partner_reg = f"%f{len(value_regs)}"
+        value_regs[op.state_b[0]] = partner_reg
+
+        offset = op.length // 2
+
+        while offset > 0:
+            body_instructions.extend([
+                f"mov.b32 %r_shfl_src, {acc_reg};",
+                f"shfl.sync.bfly.b32 %r_shfl_dst, "
+                f"%r_shfl_src, {offset}, 0x1f, 0xffffffff;",
+                f"mov.b32 {partner_reg}, %r_shfl_dst;",
+                f"add.f32 {acc_reg}, {acc_reg}, {partner_reg};"
+            ])
+
+            offset //= 2
+    
+    elif type(op).__name__ == "Smem":
+        if op.dtype != "float":
+            raise NotImplementedError(
+                f"Unsupported shared dtype: {op.dtype}"
+            )
+
+        num_elements = 1
+        for extent in op.extents:
+            num_elements *= int(extent)
+
+        size_bytes = num_elements * 4
+
+        shared_declarations.append(
+            f".shared .align 4 .b8 {op.name}[{size_bytes}];"
+        )
+    
+    elif type(op).__name__ == "Cond":
+        cond = op.cond
+
+        if (
+            cond.op == "=="
+            and getattr(cond.left, "name", None) == "lane"
+            and getattr(cond.right, "value", None) == 0
+        ):
+            write_op = op.body[0]
+
+            if type(write_op).__name__ != "Write":
+                raise NotImplementedError(
+                    "Expected shared-memory Write"
+                )
+
+            source_reg = value_regs[write_op.values[0]]
+            shared_name = write_op.output
+
+            body_instructions.extend([
+                "setp.ne.u32 %p_not_lane0, %r_lane, 0;",
+                f"@%p_not_lane0 bra COND_END_{i};",
+                f"mov.u32 %r_smem_base, {shared_name};",
+                "mul.lo.u32 %r_smem_off, %r_warp, 4;",
+                "add.u32 %r_smem_addr, %r_smem_base, %r_smem_off;",
+                f"st.shared.f32 [%r_smem_addr], {source_reg};",
+                f"COND_END_{i}:"
+            ])
+
+        
+        elif (
+            cond.op == "=="
+            and getattr(cond.left, "name", None) == axis.name
+            and getattr(cond.right, "value", None) == 0
+        ):
+            
+            # Check whether this thread should execute the output operations
+            body_instructions.extend([
+                f"setp.ne.u32 %p_not_output, "
+                f"%r_{cond.left.name}, {cond.right.value};",
+                f"@%p_not_output bra COND_END_{i};"
+            ])
+
+            # Process every operation inside this Cond
+            for inner in op.body:
+
+                if type(inner).__name__ == "Load":
+                    if (
+                        len(inner.index) != 1
+                        or getattr(inner.index[0], "value", None) != 0
+                    ):
+                        raise NotImplementedError(
+                            "Only scalar index-zero loads supported here"
+                        )
+
+                    dest_reg = f"%f{len(value_regs)}"
+                    value_regs[inner.names[0]] = dest_reg
+
+                    param_index = arg_order.index(inner.input)
+
+                    body_instructions.append(
+                        f"ld.global.f32 {dest_reg}, "
+                        f"[%rd_base{param_index}];"
+                    )
+
+                elif type(inner).__name__ == "Assign":
+                    if inner.op.name != "divide":
+                        raise NotImplementedError(
+                            f"Unsupported operation: {inner.op.name}"
+                        )
+
+                    dest_reg = f"%f{len(value_regs)}"
+                    value_regs[inner.name] = dest_reg
+
+                    left_reg = value_regs[inner.args[0]]
+                    right_reg = value_regs[inner.args[1]]
+
+                    body_instructions.append(
+                        f"div.rn.f32 {dest_reg}, "
+                        f"{left_reg}, {right_reg};"
+                    )
+
+                elif type(inner).__name__ == "Write":
+                    if inner.index:
+                        raise NotImplementedError(
+                            "Expected scalar output"
+                        )
+
+                    source_reg = value_regs[inner.values[0]]
+                    output_index = arg_order.index(inner.output)
+
+                    body_instructions.append(
+                        f"st.global.f32 "
+                        f"[%rd_base{output_index}], {source_reg};"
+                    )
+
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported nested operation: {type(inner).__name__}"
+                    )
+
+            body_instructions.append(f"COND_END_{i}:")
+
+
+        else:
+            raise NotImplementedError(
+                f"Unsupported condition: {cond}"
+            )
+
+
+    
+    elif type(op).__name__ == "TreeHalve":
+        shared_name = op.bufs[0]
+        acc_reg = value_regs[op.state[0]]
+        temp_reg = value_regs[op.state_b[0]]
+
+        # Only thread 0 combines the warp sums
+        body_instructions.extend([
+            "setp.ne.u32 %p_not_tree0, %r_tid, 0;",
+            f"@%p_not_tree0 bra TREE_END_{i};",
+            f"mov.u32 %r_smem_base, {shared_name};"
+        ])
+
+        # acc_reg already contains warp 0's sum
+        for k in range(1, op.length):
+            offset = k * 4
+
+            body_instructions.extend([
+                f"ld.shared.f32 {temp_reg}, "
+                f"[%r_smem_base+{offset}];",
+                f"add.f32 {acc_reg}, {acc_reg}, {temp_reg};"
+            ])
+
+        body_instructions.append(f"TREE_END_{i}:")
+
+
+
+    elif type(op).__name__ == "Sync":
+        body_instructions.append("bar.sync 0;")
+
+
+
     
 print("Register mapping:", value_regs, file=sys.stderr)
 print("Arithmetic PTX:", file=sys.stderr)
@@ -230,13 +482,50 @@ for j, arg_name in enumerate(arg_order):
 
 ptx_lines.append(")")
 
-# ADD THE NEW CODE HERE
+
 ptx_lines.append("{")
+for declaration in shared_declarations:
+    ptx_lines.append(f"    {declaration}")
 
 ptx_lines.append(
     "    .reg .u32 %r_tid, %r_bid, %r_bdim, %r_a0;"
 )
 ptx_lines.append("    .reg .pred %p_out;")
+
+# Registers for warp and lane identification
+ptx_lines.append(
+    "    .reg .u32 %r_lane, %r_warp;"
+)
+
+# Registers for shared-memory addressing
+ptx_lines.append(
+    "    .reg .u32 %r_smem_base, %r_smem_off, %r_smem_addr;"
+)
+
+
+ptx_lines.append(
+    "    .reg .pred %p_not_lane0;"
+)
+ptx_lines.append("    .reg .pred %p_not_tree0;")
+ptx_lines.append("    .reg .pred %p_not_output;")
+
+ptx_lines.append("    .reg .pred %p_loop;")
+if any(type(op).__name__ == "WarpShuffle" for op in tile.body):
+    ptx_lines.append(
+        "    .reg .b32 %r_shfl_src, %r_shfl_dst;"
+    )
+
+axis_names = {axis.name}
+axis_names.update(
+    op.axis.name
+    for op in tile.body
+    if type(op).__name__ == "StridedLoop"
+)
+
+for name in sorted(axis_names):
+    if name != "a0":
+        ptx_lines.append(f"    .reg .u32 %r_{name};")
+
 ptx_lines.append(f"    .reg .u32 %r<{len(instructions) + 1}>;")
 ptx_lines.append(f"    .reg .u64 %rd_param<{len(arg_order)}>;")
 ptx_lines.append(f"    .reg .u64 %rd_base<{len(arg_order)}>;")
@@ -248,9 +537,19 @@ ptx_lines.extend([
     "    mov.u32 %r_bid, %ctaid.x;",
     "    mov.u32 %r_bdim, %ntid.x;",
     "    mad.lo.u32 %r_a0, %r_bid, %r_bdim, %r_tid;",
-    f"    setp.ge.u32 %p_out, %r_a0, {axis.extent};",
+    f"    setp.ge.u32 %p_out, %r_a0, {axis.extent.as_static()};",
     "    @%p_out bra DONE;"
 ])
+
+ptx_lines.extend([
+    "    and.b32 %r_lane, %r_tid, 31;",
+    "    shr.u32 %r_warp, %r_tid, 5;"
+])
+
+if axis.name != "a0":
+    ptx_lines.append(
+        f"    mov.u32 %r_{axis.name}, %r_a0;"
+    )
 
 # Add kernel parameter pointers
 for inst in pointer_instructions:
