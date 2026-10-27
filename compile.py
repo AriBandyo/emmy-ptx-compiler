@@ -141,7 +141,26 @@ for i, op in enumerate(tile.body):
                     f"add.u64 %rd_addr{i}, %rd_base{param_index}, %rd_offset{i};",
                     f"ld.global.f32 {dest_reg}, [%rd_addr{i}];"
                 ])
-            
+
+            elif type(inner).__name__ == "Assign":
+                op_name = inner.op.name
+
+                if op_name not in ptx_float_opcodes:
+                    raise NotImplementedError(
+                        f"Unsupported loop operation: {op_name}"
+                    )
+
+                dest_reg = f"%f{len(value_regs)}"
+                value_regs[inner.name] = dest_reg
+
+                left_reg = value_regs[inner.args[0]]
+                right_reg = value_regs[inner.args[1]]
+
+                opcode = ptx_float_opcodes[op_name]
+
+                body_instructions.append(
+                    f"{opcode} {dest_reg}, {left_reg}, {right_reg};"
+                )
             elif type(inner).__name__ == "Accum":
                 acc_reg = value_regs[inner.name]
                 src_reg = value_regs[inner.value]
@@ -151,6 +170,55 @@ for i, op in enumerate(tile.body):
                 )
 
                 body_instructions.append(instruction)
+
+            elif type(inner).__name__ == "Write":
+                if len(inner.values) != 1:
+                    raise NotImplementedError(
+                        "Only scalar loop writes supported"
+                    )
+
+                source_reg = value_regs[inner.values[0]]
+                output_index = arg_order.index(inner.output)
+
+                start = len(instructions)
+
+                if len(inner.index) == 2:
+                    row = compiler_expr(inner.index[0])
+                    col = compiler_expr(inner.index[1])
+
+                    shape = next(
+                        arg["shape"]
+                        for arg in kernel_meta["args"]
+                        if arg["name"] == inner.output
+                    )
+
+                    stride = shape[1]
+                    index_reg = f"%r{len(instructions) + 1}"
+
+                    instructions.append(
+                        f"mad.lo.u32 {index_reg}, "
+                        f"{row}, {stride}, {col};"
+                    )
+
+                elif len(inner.index) == 1:
+                    index_reg = compiler_expr(inner.index[0])
+
+                else:
+                    raise NotImplementedError(
+                        "Unsupported loop write index"
+                    )
+
+                body_instructions.extend(instructions[start:])
+
+                body_instructions.extend([
+                    f"mul.wide.u32 %rd_offset{i}, "
+                    f"{index_reg}, {inner.value_dtype.nbytes};",
+
+                    f"add.u64 %rd_addr{i}, "
+                    f"%rd_base{output_index}, %rd_offset{i};",
+
+                    f"st.global.f32 [%rd_addr{i}], {source_reg};"
+                ])
 
 
         # Move to the next element
@@ -213,6 +281,19 @@ for i, op in enumerate(tile.body):
             src_reg = value_regs[op.args[0]]
             instruction = (
                 f"max.f32 {dest_reg}, {src_reg},0f00000000;"
+            )
+        elif op.op.name in ("reciprocal", "sqrt"):
+            src_reg = value_regs[op.args[0]]
+
+            unary_opcodes = {
+                "reciprocal": "rcp.rn.f32",
+                "sqrt": "sqrt.rn.f32"
+            }
+
+            opcode = unary_opcodes[op.op.name]
+
+            instruction = (
+                f"{opcode} {dest_reg}, {src_reg};"
             )
         else:
 
@@ -458,7 +539,26 @@ for i, op in enumerate(tile.body):
                 f"add.f32 {acc_reg}, {acc_reg}, {temp_reg};"
             ])
 
-        body_instructions.append(f"TREE_END_{i}:")
+       
+        needs_broadcast = any(
+            type(later).__name__ == "Assign"
+            and op.state[0] in later.args
+            for later in tile.body[i + 1:]
+        )
+
+        if needs_broadcast:
+            body_instructions.extend([
+                # Only thread 0 reaches this instruction
+                f"st.shared.f32 [%r_smem_base], {acc_reg};",
+
+                # All threads continue here
+                f"TREE_END_{i}:",
+                f"mov.u32 %r_smem_base, {shared_name};",
+                "bar.sync 0;",
+                f"ld.shared.f32 {acc_reg}, [%r_smem_base];"
+            ])
+        else:
+            body_instructions.append(f"TREE_END_{i}:")
 
 
 
