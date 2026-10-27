@@ -113,7 +113,28 @@ for i, op in enumerate(tile.body):
                 value_regs[inner.names[0]] = dest_reg
 
                 param_index = arg_order.index(inner.input)
-                index_reg = compiler_expr(inner.index[0])
+                start = len(instructions)
+
+                if len(inner.index) == 2:
+                    row = compiler_expr(inner.index[0])
+                    col = compiler_expr(inner.index[1])
+
+                    shape = next(
+                        arg["shape"]
+                        for arg in kernel_meta["args"]
+                        if arg["name"] == inner.input
+                    )
+
+                    stride = shape[1]
+                    index_reg = f"%r{len(instructions) + 1}"
+
+                    instructions.append(
+                        f"mad.lo.u32 {index_reg}, {row}, {stride}, {col};"
+                    )
+                else:
+                    index_reg = compiler_expr(inner.index[0])
+
+                body_instructions.extend(instructions[start:])
 
                 body_instructions.extend([
                     f"mul.wide.u32 %rd_offset{i}, {index_reg}, {inner.dtype.nbytes};",
@@ -319,7 +340,7 @@ for i, op in enumerate(tile.body):
         
         elif (
             cond.op == "=="
-            and getattr(cond.left, "name", None) == axis.name
+            and getattr(cond.left, "name", None) in {a.name for a in tile.axes}
             and getattr(cond.right, "value", None) == 0
         ):
             
@@ -370,23 +391,40 @@ for i, op in enumerate(tile.body):
                     )
 
                 elif type(inner).__name__ == "Write":
-                    if inner.index:
-                        raise NotImplementedError(
-                            "Expected scalar output"
-                        )
-
                     source_reg = value_regs[inner.values[0]]
                     output_index = arg_order.index(inner.output)
 
-                    body_instructions.append(
-                        f"st.global.f32 "
-                        f"[%rd_base{output_index}], {source_reg};"
-                    )
+                    if len(inner.index) == 0:
+                        # Original scalar output
+                        body_instructions.append(
+                            f"st.global.f32 "
+                            f"[%rd_base{output_index}], {source_reg};"
+                        )
 
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported nested operation: {type(inner).__name__}"
-                    )
+                    elif len(inner.index) == 1:
+                        # Indexed output, e.g. sum_1[a0]
+                        start = len(instructions)
+                        index_reg = compiler_expr(inner.index[0])
+
+                        body_instructions.extend(instructions[start:])
+
+                        offset_reg = f"%rd_offset{i}"
+                        addr_reg = f"%rd_addr{i}"
+
+                        body_instructions.extend([
+                            f"mul.wide.u32 {offset_reg}, "
+                            f"{index_reg}, {inner.value_dtype.nbytes};",
+
+                            f"add.u64 {addr_reg}, "
+                            f"%rd_base{output_index}, {offset_reg};",
+
+                            f"st.global.f32 [{addr_reg}], {source_reg};"
+                        ])
+
+                    else:
+                        raise NotImplementedError(
+                            "Multidimensional conditional writes not supported"
+                        )
 
             body_instructions.append(f"COND_END_{i}:")
 
@@ -515,7 +553,7 @@ if any(type(op).__name__ == "WarpShuffle" for op in tile.body):
         "    .reg .b32 %r_shfl_src, %r_shfl_dst;"
     )
 
-axis_names = {axis.name}
+axis_names = {a.name for a in tile.axes}
 axis_names.update(
     op.axis.name
     for op in tile.body
@@ -535,21 +573,34 @@ ptx_lines.append(f"    .reg .f32 %f<{len(value_regs)}>;")
 ptx_lines.extend([
     "    mov.u32 %r_tid, %tid.x;",
     "    mov.u32 %r_bid, %ctaid.x;",
-    "    mov.u32 %r_bdim, %ntid.x;",
-    "    mad.lo.u32 %r_a0, %r_bid, %r_bdim, %r_tid;",
-    f"    setp.ge.u32 %p_out, %r_a0, {axis.extent.as_static()};",
-    "    @%p_out bra DONE;"
+    "    mov.u32 %r_bdim, %ntid.x;"
 ])
 
-ptx_lines.extend([
-    "    and.b32 %r_lane, %r_tid, 31;",
-    "    shr.u32 %r_warp, %r_tid, 5;"
-])
+if len(tile.axes) == 2:
+    # r04: one block processes one matrix row
+    ptx_lines.extend([
+        "    mov.u32 %r_a0, %r_bid;",
+        f"    mov.u32 %r_{tile.axes[1].name}, %r_tid;",
+        f"    setp.ge.u32 %p_out, %r_a0, {axis.extent.as_static()};",
+        "    @%p_out bra DONE;"
+    ])
+else:
+    # Preserve the mapping for our previous 1D problems
+    ptx_lines.extend([
+        "    mad.lo.u32 %r_a0, %r_bid, %r_bdim, %r_tid;",
+        f"    setp.ge.u32 %p_out, %r_a0, {axis.extent.as_static()};",
+        "    @%p_out bra DONE;"
+    ])
 
 if axis.name != "a0":
     ptx_lines.append(
         f"    mov.u32 %r_{axis.name}, %r_a0;"
     )
+
+ptx_lines.extend([
+    "    and.b32 %r_lane, %r_tid, 31;",
+    "    shr.u32 %r_warp, %r_tid, 5;"
+])
 
 # Add kernel parameter pointers
 for inst in pointer_instructions:
