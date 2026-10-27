@@ -1,5 +1,6 @@
 import json
 import sys
+import struct
 from pathlib import Path
 from emmy.compiler.graph import Graph
 
@@ -25,7 +26,9 @@ arithmetic_instructions = []
 ptx_float_opcodes = {
     "add": "add.f32",
     "multiply": "mul.f32",
-    "sub": "sub.f32"
+    "sub": "sub.f32",
+    "subtract": "sub.f32",
+    "maximum": "max.f32"
 }
 instructions = []
 
@@ -82,10 +85,16 @@ for i, op in enumerate(tile.body):
     arg_order = kernel_meta["arg_order"]
     if type(op).__name__ == "StridedLoop":
 
-        # Initialize reduction accumulators
+       
         for inner in op.body:
             if type(inner).__name__ == "Accum":
-                if inner.op.name != "add":
+
+                identities = {
+                    "add": "0f00000000",
+                    "maximum": "0fF149F2CA"
+                }
+
+                if inner.op.name not in identities:
                     raise NotImplementedError(
                         f"Unsupported accumulator: {inner.op.name}"
                     )
@@ -93,8 +102,10 @@ for i, op in enumerate(tile.body):
                 acc_reg = f"%f{len(value_regs)}"
                 value_regs[inner.name] = acc_reg
 
+                identity = identities[inner.op.name]
+
                 body_instructions.append(
-                    f"mov.f32 {acc_reg}, 0f00000000;"
+                    f"mov.f32 {acc_reg}, {identity};"
                 )
 
         start_reg = f"%r_{op.start.name}"
@@ -108,7 +119,28 @@ for i, op in enumerate(tile.body):
             f"@%p_loop bra LOOP_END_{i};"
         ])
         for inner in op.body:
-            if type(inner).__name__ == "Load":
+
+            if type(inner).__name__ == "Let":
+
+                if type(inner.value).__name__ != "Literal":
+                    raise NotImplementedError(
+                        "Unsupported Let expression"
+                    )
+
+                dest_reg = f"%f{len(value_regs)}"
+                value_regs[inner.name] = dest_reg
+
+                bits = struct.unpack(
+                    "<I",
+                    struct.pack("<f", float(inner.value.value))
+                )[0]
+
+                body_instructions.append(
+                    f"mov.f32 {dest_reg}, 0f{bits:08X};"
+                )
+
+            elif type(inner).__name__ == "Load":
+
                 dest_reg = f"%f{len(value_regs)}"
                 value_regs[inner.names[0]] = dest_reg
 
@@ -129,49 +161,94 @@ for i, op in enumerate(tile.body):
                     index_reg = f"%r{len(instructions) + 1}"
 
                     instructions.append(
-                        f"mad.lo.u32 {index_reg}, {row}, {stride}, {col};"
+                        f"mad.lo.u32 {index_reg}, "
+                        f"{row}, {stride}, {col};"
                     )
-                else:
+
+                elif len(inner.index) == 1:
                     index_reg = compiler_expr(inner.index[0])
+
+                else:
+                    raise NotImplementedError(
+                        "Unsupported loop load index"
+                    )
 
                 body_instructions.extend(instructions[start:])
 
                 body_instructions.extend([
-                    f"mul.wide.u32 %rd_offset{i}, {index_reg}, {inner.dtype.nbytes};",
-                    f"add.u64 %rd_addr{i}, %rd_base{param_index}, %rd_offset{i};",
+                    f"mul.wide.u32 %rd_offset{i}, "
+                    f"{index_reg}, {inner.dtype.nbytes};",
+
+                    f"add.u64 %rd_addr{i}, "
+                    f"%rd_base{param_index}, %rd_offset{i};",
+
                     f"ld.global.f32 {dest_reg}, [%rd_addr{i}];"
                 ])
 
             elif type(inner).__name__ == "Assign":
-                op_name = inner.op.name
 
-                if op_name not in ptx_float_opcodes:
-                    raise NotImplementedError(
-                        f"Unsupported loop operation: {op_name}"
-                    )
+                op_name = inner.op.name
 
                 dest_reg = f"%f{len(value_regs)}"
                 value_regs[inner.name] = dest_reg
 
-                left_reg = value_regs[inner.args[0]]
-                right_reg = value_regs[inner.args[1]]
+                if op_name == "exp":
 
-                opcode = ptx_float_opcodes[op_name]
+                    src_reg = value_regs[inner.args[0]]
 
-                body_instructions.append(
-                    f"{opcode} {dest_reg}, {left_reg}, {right_reg};"
-                )
+                    body_instructions.extend([
+                        f"mul.f32 {dest_reg}, "
+                        f"{src_reg}, 0f3FB8AA3B;",
+
+                        f"ex2.approx.f32 {dest_reg}, {dest_reg};"
+                    ])
+
+                else:
+
+                    if op_name not in ptx_float_opcodes:
+                        raise NotImplementedError(
+                            f"Unsupported loop operation: {op_name}"
+                        )
+
+                    left_reg = value_regs[inner.args[0]]
+                    right_reg = value_regs[inner.args[1]]
+
+                    opcode = ptx_float_opcodes[op_name]
+
+                    body_instructions.append(
+                        f"{opcode} {dest_reg}, "
+                        f"{left_reg}, {right_reg};"
+                    )
+
             elif type(inner).__name__ == "Accum":
+
                 acc_reg = value_regs[inner.name]
                 src_reg = value_regs[inner.value]
 
-                instruction = (
-                    f"add.f32 {acc_reg}, {acc_reg}, {src_reg};"
+                if inner.base is not None:
+                    base_reg = value_regs[inner.base]
+                else:
+                    base_reg = acc_reg
+
+                accumulator_opcodes = {
+                    "add": "add.f32",
+                    "maximum": "max.f32"
+                }
+
+                if inner.op.name not in accumulator_opcodes:
+                    raise NotImplementedError(
+                        f"Unsupported accumulator: {inner.op.name}"
+                    )
+
+                opcode = accumulator_opcodes[inner.op.name]
+
+                body_instructions.append(
+                    f"{opcode} {acc_reg}, "
+                    f"{base_reg}, {src_reg};"
                 )
 
-                body_instructions.append(instruction)
-
             elif type(inner).__name__ == "Write":
+
                 if len(inner.values) != 1:
                     raise NotImplementedError(
                         "Only scalar loop writes supported"
@@ -219,6 +296,12 @@ for i, op in enumerate(tile.body):
 
                     f"st.global.f32 [%rd_addr{i}], {source_reg};"
                 ])
+
+            else:
+                raise NotImplementedError(
+                    f"Unsupported loop statement: "
+                    f"{type(inner).__name__}"
+                )
 
 
         # Move to the next element
@@ -345,40 +428,86 @@ for i, op in enumerate(tile.body):
 
     
     elif type(op).__name__ == "WarpShuffle":
-        if len(op.state) != 1 or len(op.state_b) != 1:
+
+        if len(op.state) != len(op.state_b):
             raise NotImplementedError(
-                "Multiple shuffle states not supported yet"
+                "Mismatched shuffle states"
             )
 
-        combine = op.combine_states[0]
-        if combine.op.name != "add":
-            raise NotImplementedError(
-                f"Unsupported shuffle operation: {combine.op.name}"
-            )
-
-        acc_reg = value_regs[op.state[0]]
-
-        partner_reg = f"%f{len(value_regs)}"
-        value_regs[op.state_b[0]] = partner_reg
+        for partner_name in op.state_b:
+            if partner_name not in value_regs:
+                value_regs[partner_name] = f"%f{len(value_regs)}"
 
         offset = op.length // 2
 
         while offset > 0:
-            body_instructions.extend([
-                f"mov.b32 %r_shfl_src, {acc_reg};",
-                f"shfl.sync.bfly.b32 %r_shfl_dst, "
-                f"%r_shfl_src, {offset}, 0x1f, 0xffffffff;",
-                f"mov.b32 {partner_reg}, %r_shfl_dst;",
-                f"add.f32 {acc_reg}, {acc_reg}, {partner_reg};"
-            ])
+
+            for state_name, partner_name in zip(
+                op.state, op.state_b
+            ):
+                src_reg = value_regs[state_name]
+                partner_reg = value_regs[partner_name]
+
+                body_instructions.extend([
+                    f"mov.b32 %r_shfl_src, {src_reg};",
+                    f"shfl.sync.bfly.b32 %r_shfl_dst, "
+                    f"%r_shfl_src, {offset}, 0x1f, 0xffffffff;",
+                    f"mov.b32 {partner_reg}, %r_shfl_dst;"
+                ])
+
+            for combine in op.combine_states:
+
+                op_name = combine.op.name
+
+                if combine.name not in value_regs:
+                    value_regs[combine.name] = f"%f{len(value_regs)}"
+
+                dest_reg = value_regs[combine.name]
+
+                if op_name == "copy":
+
+                    src_reg = value_regs[combine.args[0]]
+
+                    body_instructions.append(
+                        f"mov.f32 {dest_reg}, {src_reg};"
+                    )
+
+                elif op_name == "exp":
+
+                    src_reg = value_regs[combine.args[0]]
+
+                    body_instructions.extend([
+                        f"mul.f32 {dest_reg}, "
+                        f"{src_reg}, 0f3FB8AA3B;",
+                        f"ex2.approx.f32 {dest_reg}, {dest_reg};"
+                    ])
+
+                else:
+
+                    if op_name not in ptx_float_opcodes:
+                        raise NotImplementedError(
+                            f"Unsupported shuffle operation: {op_name}"
+                        )
+
+                    left_reg = value_regs[combine.args[0]]
+                    right_reg = value_regs[combine.args[1]]
+
+                    opcode = ptx_float_opcodes[op_name]
+
+                    body_instructions.append(
+                        f"{opcode} {dest_reg}, "
+                        f"{left_reg}, {right_reg};"
+                    )
 
             offset //= 2
-    
+
     elif type(op).__name__ == "Smem":
         if op.dtype != "float":
             raise NotImplementedError(
                 f"Unsupported shared dtype: {op.dtype}"
             )
+
+        
 
         num_elements = 1
         for extent in op.extents:
@@ -398,41 +527,53 @@ for i, op in enumerate(tile.body):
             and getattr(cond.left, "name", None) == "lane"
             and getattr(cond.right, "value", None) == 0
         ):
-            write_op = op.body[0]
-
-            if type(write_op).__name__ != "Write":
-                raise NotImplementedError(
-                    "Expected shared-memory Write"
-                )
-
-            source_reg = value_regs[write_op.values[0]]
-            shared_name = write_op.output
-
             body_instructions.extend([
                 "setp.ne.u32 %p_not_lane0, %r_lane, 0;",
-                f"@%p_not_lane0 bra COND_END_{i};",
-                f"mov.u32 %r_smem_base, {shared_name};",
-                "mul.lo.u32 %r_smem_off, %r_warp, 4;",
-                "add.u32 %r_smem_addr, %r_smem_base, %r_smem_off;",
-                f"st.shared.f32 [%r_smem_addr], {source_reg};",
-                f"COND_END_{i}:"
+                f"@%p_not_lane0 bra COND_END_{i};"
             ])
 
-        
+            for write_op in op.body:
+                if type(write_op).__name__ != "Write":
+                    raise NotImplementedError(
+                        "Expected shared-memory Write"
+                    )
+
+                if len(write_op.values) != 1:
+                    raise NotImplementedError(
+                        "Only scalar shared-memory writes supported"
+                    )
+
+                if (
+                    len(write_op.index) != 1
+                    or getattr(write_op.index[0], "name", None) != "warp"
+                ):
+                    raise NotImplementedError(
+                        "Unsupported shared-memory write index"
+                    )
+
+                source_reg = value_regs[write_op.values[0]]
+                shared_name = write_op.output
+
+                body_instructions.extend([
+                    f"mov.u32 %r_smem_base, {shared_name};",
+                    "mul.lo.u32 %r_smem_off, %r_warp, 4;",
+                    "add.u32 %r_smem_addr, %r_smem_base, %r_smem_off;",
+                    f"st.shared.f32 [%r_smem_addr], {source_reg};"
+                ])
+
+            body_instructions.append(f"COND_END_{i}:")
+
         elif (
             cond.op == "=="
             and getattr(cond.left, "name", None) in {a.name for a in tile.axes}
             and getattr(cond.right, "value", None) == 0
         ):
-            
-            # Check whether this thread should execute the output operations
             body_instructions.extend([
                 f"setp.ne.u32 %p_not_output, "
                 f"%r_{cond.left.name}, {cond.right.value};",
                 f"@%p_not_output bra COND_END_{i};"
             ])
 
-            # Process every operation inside this Cond
             for inner in op.body:
 
                 if type(inner).__name__ == "Load":
@@ -476,14 +617,12 @@ for i, op in enumerate(tile.body):
                     output_index = arg_order.index(inner.output)
 
                     if len(inner.index) == 0:
-                        # Original scalar output
                         body_instructions.append(
                             f"st.global.f32 "
                             f"[%rd_base{output_index}], {source_reg};"
                         )
 
                     elif len(inner.index) == 1:
-                        # Indexed output, e.g. sum_1[a0]
                         start = len(instructions)
                         index_reg = compiler_expr(inner.index[0])
 
@@ -507,59 +646,154 @@ for i, op in enumerate(tile.body):
                             "Multidimensional conditional writes not supported"
                         )
 
-            body_instructions.append(f"COND_END_{i}:")
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported conditional operation: "
+                        f"{type(inner).__name__}"
+                    )
 
+            body_instructions.append(f"COND_END_{i}:")
 
         else:
             raise NotImplementedError(
                 f"Unsupported condition: {cond}"
             )
-
-
     
     elif type(op).__name__ == "TreeHalve":
-        shared_name = op.bufs[0]
-        acc_reg = value_regs[op.state[0]]
-        temp_reg = value_regs[op.state_b[0]]
 
-        # Only thread 0 combines the warp sums
-        body_instructions.extend([
-            "setp.ne.u32 %p_not_tree0, %r_tid, 0;",
-            f"@%p_not_tree0 bra TREE_END_{i};",
-            f"mov.u32 %r_smem_base, {shared_name};"
-        ])
+        if len(op.state) > 1:
 
-        # acc_reg already contains warp 0's sum
-        for k in range(1, op.length):
-            offset = k * 4
+            if not (
+                len(op.state) == len(op.state_b) == len(op.bufs)
+            ):
+                raise NotImplementedError(
+                    "Mismatched tree reduction states"
+                )
+
+            for name in op.state_b:
+                if name not in value_regs:
+                    value_regs[name] = f"%f{len(value_regs)}"
 
             body_instructions.extend([
-                f"ld.shared.f32 {temp_reg}, "
-                f"[%r_smem_base+{offset}];",
-                f"add.f32 {acc_reg}, {acc_reg}, {temp_reg};"
+                "setp.ne.u32 %p_not_tree0, %r_tid, 0;",
+                f"@%p_not_tree0 bra TREE_END_{i};"
             ])
 
-       
-        needs_broadcast = any(
-            type(later).__name__ == "Assign"
-            and op.state[0] in later.args
-            for later in tile.body[i + 1:]
-        )
+            for k in range(1, op.length):
 
-        if needs_broadcast:
+                for shared_name, partner_name in zip(
+                    op.bufs, op.state_b
+                ):
+                    partner_reg = value_regs[partner_name]
+
+                    body_instructions.extend([
+                        f"mov.u32 %r_smem_base, {shared_name};",
+                        f"ld.shared.f32 {partner_reg}, "
+                        f"[%r_smem_base+{k * 4}];"
+                    ])
+
+                for combine in op.combine_states:
+
+                    op_name = combine.op.name
+
+                    if combine.name not in value_regs:
+                        value_regs[combine.name] = f"%f{len(value_regs)}"
+
+                    dest_reg = value_regs[combine.name]
+
+                    if op_name == "copy":
+                        src_reg = value_regs[combine.args[0]]
+
+                        body_instructions.append(
+                            f"mov.f32 {dest_reg}, {src_reg};"
+                        )
+
+                    elif op_name == "exp":
+                        src_reg = value_regs[combine.args[0]]
+
+                        body_instructions.extend([
+                            f"mul.f32 {dest_reg}, "
+                            f"{src_reg}, 0f3FB8AA3B;",
+                            f"ex2.approx.f32 {dest_reg}, {dest_reg};"
+                        ])
+
+                    else:
+                        if op_name not in ptx_float_opcodes:
+                            raise NotImplementedError(
+                                f"Unsupported tree operation: {op_name}"
+                            )
+
+                        left_reg = value_regs[combine.args[0]]
+                        right_reg = value_regs[combine.args[1]]
+                        opcode = ptx_float_opcodes[op_name]
+
+                        body_instructions.append(
+                            f"{opcode} {dest_reg}, "
+                            f"{left_reg}, {right_reg};"
+                        )
+
+            for state_name, shared_name in zip(
+                op.state, op.bufs
+            ):
+                acc_reg = value_regs[state_name]
+
+                body_instructions.extend([
+                    f"mov.u32 %r_smem_base, {shared_name};",
+                    f"st.shared.f32 [%r_smem_base], {acc_reg};"
+                ])
+
             body_instructions.extend([
-                # Only thread 0 reaches this instruction
-                f"st.shared.f32 [%r_smem_base], {acc_reg};",
-
-                # All threads continue here
                 f"TREE_END_{i}:",
-                f"mov.u32 %r_smem_base, {shared_name};",
-                "bar.sync 0;",
-                f"ld.shared.f32 {acc_reg}, [%r_smem_base];"
+                "bar.sync 0;"
             ])
-        else:
-            body_instructions.append(f"TREE_END_{i}:")
 
+            for state_name, shared_name in zip(
+                op.state, op.bufs
+            ):
+                acc_reg = value_regs[state_name]
+
+                body_instructions.extend([
+                    f"mov.u32 %r_smem_base, {shared_name};",
+                    f"ld.shared.f32 {acc_reg}, [%r_smem_base];"
+                ])
+
+        else:
+
+            shared_name = op.bufs[0]
+            acc_reg = value_regs[op.state[0]]
+            temp_reg = value_regs[op.state_b[0]]
+
+            body_instructions.extend([
+                "setp.ne.u32 %p_not_tree0, %r_tid, 0;",
+                f"@%p_not_tree0 bra TREE_END_{i};",
+                f"mov.u32 %r_smem_base, {shared_name};"
+            ])
+
+            for k in range(1, op.length):
+                offset = k * 4
+
+                body_instructions.extend([
+                    f"ld.shared.f32 {temp_reg}, "
+                    f"[%r_smem_base+{offset}];",
+                    f"add.f32 {acc_reg}, {acc_reg}, {temp_reg};"
+                ])
+
+            needs_broadcast = any(
+                type(later).__name__ == "Assign"
+                and op.state[0] in later.args
+                for later in tile.body[i + 1:]
+            )
+
+            if needs_broadcast:
+                body_instructions.extend([
+                    f"st.shared.f32 [%r_smem_base], {acc_reg};",
+                    f"TREE_END_{i}:",
+                    f"mov.u32 %r_smem_base, {shared_name};",
+                    "bar.sync 0;",
+                    f"ld.shared.f32 {acc_reg}, [%r_smem_base];"
+                ])
+            else:
+                body_instructions.append(f"TREE_END_{i}:")
 
 
     elif type(op).__name__ == "Sync":
@@ -622,7 +856,7 @@ ptx_lines.append(")")
 
 
 ptx_lines.append("{")
-for declaration in shared_declarations:
+for declaration in dict.fromkeys(shared_declarations):
     ptx_lines.append(f"    {declaration}")
 
 ptx_lines.append(
