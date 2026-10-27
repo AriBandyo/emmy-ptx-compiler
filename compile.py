@@ -43,7 +43,29 @@ def compiler_expr(expr):
 
         return str(expr.value)
 
+    if kind == "TernaryExpr":
+        cond = expr.cond
 
+        if type(cond).__name__ != "BinaryExpr" or cond.op != "<":
+            raise NotImplementedError(
+                f"Unsupported ternary condition: {cond}"
+            )
+
+        true_reg = compiler_expr(expr.if_true)
+        false_reg = compiler_expr(expr.if_false)
+
+        left_reg = compiler_expr(cond.left)
+        right_reg = compiler_expr(cond.right)
+
+        dest = f"%r{len(instructions) + 1}"
+
+        instructions.extend([
+            f"setp.lt.u32 %p_ternary, {left_reg}, {right_reg};",
+            f"selp.u32 {dest}, {true_reg}, {false_reg}, %p_ternary;"
+        ])
+
+        return dest
+    
     if kind == "BinaryExpr":
 
         left = compiler_expr(expr.left)
@@ -54,7 +76,10 @@ def compiler_expr(expr):
 
         opcode = {
             "*": "mul.lo.u32",
-            "+": "add.u32"
+            "+": "add.u32",
+            "-": "sub.u32",
+            "/": "div.u32",
+            "%": "rem.u32"
         }[expr.op]
 
         instructions.append(
@@ -69,7 +94,113 @@ arg_order = kernel_meta["arg_order"]
 pointer_instructions = []
 body_instructions = []
 shared_declarations = []
+shared_shapes = {
+    op.name: op.extents
+    for op in tile.body
+    if type(op).__name__ == "Smem"
+}
+shared_offsets = {}
+shared_bytes = 0
+pool_alignment = 16
 
+for sm in tile.body:
+    if type(sm).__name__ == "Smem":
+        alignment = max(4, int(sm.align or 4))
+        pool_alignment = max(pool_alignment, alignment)
+
+        shared_bytes = (
+            (shared_bytes + alignment - 1) // alignment
+        ) * alignment
+
+        shared_offsets[sm.name] = shared_bytes
+
+        elements = 1
+        for extent in sm.extents:
+            elements *= int(extent)
+
+        shared_bytes += elements * 4
+
+use_dynamic_shared = shared_bytes > 49152
+def emit_cp_async(copy):
+    if copy.swizzle != "NONE":
+        raise NotImplementedError(
+            f"Unsupported async swizzle: {copy.swizzle}"
+        )
+
+    if copy.nbytes not in (4, 8, 16):
+        raise NotImplementedError(
+            f"Unsupported async copy size: {copy.nbytes}"
+        )
+
+    start = len(instructions)
+
+    src_row = compiler_expr(copy.src_index[0])
+    src_col = compiler_expr(copy.src_index[1])
+
+    src_shape = next(
+        arg["shape"]
+        for arg in kernel_meta["args"]
+        if arg["name"] == copy.src
+    )
+
+    src_index = f"%r{len(instructions) + 1}"
+
+    instructions.append(
+        f"mad.lo.u32 {src_index}, "
+        f"{src_row}, {src_shape[1]}, {src_col};"
+    )
+
+    dst_row = compiler_expr(copy.smem_index[0])
+    dst_col = compiler_expr(copy.smem_index[1])
+
+    if copy.lane_index:
+        lane_row = compiler_expr(copy.lane_index[0])
+        lane_col = compiler_expr(copy.lane_index[1])
+
+        new_row = f"%r{len(instructions) + 1}"
+        instructions.append(
+            f"add.u32 {new_row}, {dst_row}, {lane_row};"
+        )
+        dst_row = new_row
+
+        new_col = f"%r{len(instructions) + 1}"
+        instructions.append(
+            f"add.u32 {new_col}, {dst_col}, {lane_col};"
+        )
+        dst_col = new_col
+
+    dst_stride = shared_shapes[copy.smem][1]
+    dst_index = f"%r{len(instructions) + 1}"
+
+    instructions.append(
+        f"mad.lo.u32 {dst_index}, "
+        f"{dst_row}, {dst_stride}, {dst_col};"
+    )
+
+    body_instructions.extend(instructions[start:])
+
+    param_index = arg_order.index(copy.src)
+    cache_mode = "cg" if copy.nbytes == 16 else "ca"
+
+    smem_base = copy.smem
+
+    if use_dynamic_shared:
+        offset = shared_offsets[copy.smem]
+        smem_base = (
+            "_smem_pool"
+            if offset == 0
+            else f"_smem_pool+{offset}"
+        )
+    body_instructions.extend([
+        f"mul.wide.u32 %rd_cp_offset, {src_index}, 4;",
+        f"add.u64 %rd_cp_addr, "
+        f"%rd_base{param_index}, %rd_cp_offset;",
+        f"mul.lo.u32 %r_cp_offset, {dst_index}, 4;",
+        f"mov.u32 %r_cp_base, {smem_base};",
+        "add.u32 %r_cp_addr, %r_cp_base, %r_cp_offset;",
+        f"cp.async.{cache_mode}.shared.global "
+        f"[%r_cp_addr], [%rd_cp_addr], {copy.nbytes};"
+    ])
 for j, arg_name in enumerate(arg_order):
     pointer_instructions.append(
         f"ld.param.u64 %rd_param{j}, [param_{arg_name}];"
@@ -81,9 +212,23 @@ for j, arg_name in enumerate(arg_order):
 for i, op in enumerate(tile.body):
 
     
-
     arg_order = kernel_meta["arg_order"]
-    if type(op).__name__ == "StridedLoop":
+
+    if type(op).__name__ == "Init":
+
+        dest_reg = f"%f{len(value_regs)}"
+        value_regs[op.name] = dest_reg
+
+        bits = struct.unpack(
+            "<I",
+            struct.pack("<f", float(op.identity))
+        )[0]
+
+        body_instructions.append(
+            f"mov.f32 {dest_reg}, 0f{bits:08X};"
+        )
+
+    elif type(op).__name__ == "StridedLoop":
 
        
         for inner in op.body:
@@ -108,7 +253,7 @@ for i, op in enumerate(tile.body):
                     f"mov.f32 {acc_reg}, {identity};"
                 )
 
-        start_reg = f"%r_{op.start.name}"
+        start_reg = compiler_expr(op.start)
         loop_reg = f"%r_{op.axis.name}"
         loop_limit = op.axis.extent.as_static()
         loop_step = op.step.value
@@ -297,10 +442,128 @@ for i, op in enumerate(tile.body):
                     f"st.global.f32 [%rd_addr{i}], {source_reg};"
                 ])
 
-            else:
-                raise NotImplementedError(
-                    f"Unsupported loop statement: "
-                    f"{type(inner).__name__}"
+            elif type(inner).__name__ == "Loop":
+
+                nested_reg = f"%r_{inner.axis.name}"
+                nested_limit = inner.axis.extent.as_static()
+                nested_label = f"INNER_{i}_{len(body_instructions)}"
+
+                body_instructions.extend([
+                    f"mov.u32 {nested_reg}, 0;",
+                    f"{nested_label}:",
+                    f"setp.ge.u32 %p_inner_loop, {nested_reg}, {nested_limit};",
+                    f"@%p_inner_loop bra {nested_label}_END;"
+                ])
+
+                for stmt in inner.body:
+
+                    if type(stmt).__name__ == "Load":
+
+                        if stmt.input not in shared_shapes:
+                            raise NotImplementedError(
+                                f"Unsupported nested load: {stmt.input}"
+                            )
+
+                        start = len(instructions)
+
+                        row_reg = compiler_expr(stmt.index[0])
+                        col_reg = compiler_expr(stmt.index[1])
+                        stride = shared_shapes[stmt.input][1]
+
+                        index_reg = f"%r{len(instructions) + 1}"
+
+                        instructions.append(
+                            f"mad.lo.u32 {index_reg}, "
+                            f"{row_reg}, {stride}, {col_reg};"
+                        )
+
+                        body_instructions.extend(instructions[start:])
+
+                        dest_reg = f"%f{len(value_regs)}"
+                        value_regs[stmt.names[0]] = dest_reg
+
+                        if use_dynamic_shared:
+                            offset = shared_offsets[stmt.input]
+                            shared_base = (
+                                "_smem_pool"
+                                if offset == 0
+                                else f"_smem_pool+{offset}"
+                            )
+                        else:
+                            shared_base = stmt.input
+
+                        body_instructions.extend([
+                            f"mov.u32 %r_smem_base, {shared_base};",
+                            f"mul.lo.u32 %r_smem_off, {index_reg}, 4;",
+                            f"add.u32 %r_smem_addr, "
+                            f"%r_smem_base, %r_smem_off;",
+                            f"ld.shared.f32 {dest_reg}, [%r_smem_addr];"
+                        ])
+
+                    elif type(stmt).__name__ == "Assign":
+
+                        if stmt.op.name not in ptx_float_opcodes:
+                            raise NotImplementedError(
+                                f"Unsupported nested operation: {stmt.op.name}"
+                            )
+
+                        dest_reg = f"%f{len(value_regs)}"
+                        value_regs[stmt.name] = dest_reg
+
+                        left_reg = value_regs[stmt.args[0]]
+                        right_reg = value_regs[stmt.args[1]]
+                        opcode = ptx_float_opcodes[stmt.op.name]
+
+                        body_instructions.append(
+                            f"{opcode} {dest_reg}, "
+                            f"{left_reg}, {right_reg};"
+                        )
+
+                    elif type(stmt).__name__ == "Accum":
+
+                        acc_reg = value_regs[stmt.name]
+                        src_reg = value_regs[stmt.value]
+
+                        base_reg = (
+                            value_regs[stmt.base]
+                            if stmt.base is not None
+                            else acc_reg
+                        )
+
+                        if stmt.op.name != "add":
+                            raise NotImplementedError(
+                                f"Unsupported nested accumulator: {stmt.op.name}"
+                            )
+
+                        body_instructions.append(
+                            f"add.f32 {acc_reg}, {base_reg}, {src_reg};"
+                        )
+
+                    else:
+                        raise NotImplementedError(
+                            f"Unsupported nested statement: "
+                            f"{type(stmt).__name__}"
+                        )
+
+                body_instructions.extend([
+                    f"add.u32 {nested_reg}, {nested_reg}, 1;",
+                    f"bra {nested_label};",
+                    f"{nested_label}_END:"
+                ])
+
+            elif type(inner).__name__ == "Sync":
+                body_instructions.append("bar.sync 0;")
+            elif type(inner).__name__ == "CpAsyncCopy":
+                emit_cp_async(inner)
+
+            elif type(inner).__name__ == "CpAsyncCommit":
+                body_instructions.append(
+                    "cp.async.commit_group;"
+                )
+
+            elif type(inner).__name__ == "CpAsyncWait":
+                body_instructions.append(
+                    f"cp.async.wait_group {inner.group};"
                 )
 
 
@@ -399,7 +662,31 @@ for i, op in enumerate(tile.body):
 
         output_param = arg_order.index(op.output)
         start = len(instructions)
-        index_reg = compiler_expr(op.index[0])
+
+        if len(op.index) == 2:
+            row_reg = compiler_expr(op.index[0])
+            col_reg = compiler_expr(op.index[1])
+
+            output_shape = next(
+                arg["shape"]
+                for arg in kernel_meta["args"]
+                if arg["name"] == op.output
+            )
+
+            index_reg = f"%r{len(instructions) + 1}"
+
+            instructions.append(
+                f"mad.lo.u32 {index_reg}, "
+                f"{row_reg}, {output_shape[1]}, {col_reg};"
+            )
+
+        elif len(op.index) == 1:
+            index_reg = compiler_expr(op.index[0])
+
+        else:
+            raise NotImplementedError(
+                "Unsupported top-level write index"
+            )
 
         body_instructions.extend(instructions[start:])
 
@@ -501,6 +788,18 @@ for i, op in enumerate(tile.body):
 
             offset //= 2
 
+    elif type(op).__name__ == "CpAsyncCopy":
+        emit_cp_async(op)
+
+    elif type(op).__name__ == "CpAsyncCommit":
+        body_instructions.append(
+            "cp.async.commit_group;"
+        )
+
+    elif type(op).__name__ == "CpAsyncWait":
+        body_instructions.append(
+            f"cp.async.wait_group {op.group};"
+        )
     elif type(op).__name__ == "Smem":
         if op.dtype != "float":
             raise NotImplementedError(
@@ -855,9 +1154,19 @@ for j, arg_name in enumerate(arg_order):
 ptx_lines.append(")")
 
 
+
+
+if use_dynamic_shared:
+    ptx_lines.insert(
+        4,
+        f".extern .shared .align {pool_alignment} .b8 _smem_pool[];"
+    )
+
 ptx_lines.append("{")
-for declaration in dict.fromkeys(shared_declarations):
-    ptx_lines.append(f"    {declaration}")
+
+if not use_dynamic_shared:
+    for declaration in dict.fromkeys(shared_declarations):
+        ptx_lines.append(f"    {declaration}")
 
 ptx_lines.append(
     "    .reg .u32 %r_tid, %r_bid, %r_bdim, %r_a0;"
@@ -882,16 +1191,28 @@ ptx_lines.append("    .reg .pred %p_not_tree0;")
 ptx_lines.append("    .reg .pred %p_not_output;")
 
 ptx_lines.append("    .reg .pred %p_loop;")
+ptx_lines.append("    .reg .pred %p_inner_loop;")
+ptx_lines.append("    .reg .pred %p_ternary;")
 if any(type(op).__name__ == "WarpShuffle" for op in tile.body):
     ptx_lines.append(
         "    .reg .b32 %r_shfl_src, %r_shfl_dst;"
     )
 
+
 axis_names = {a.name for a in tile.axes}
+
 axis_names.update(
     op.axis.name
     for op in tile.body
     if type(op).__name__ == "StridedLoop"
+)
+
+axis_names.update(
+    inner.axis.name
+    for outer in tile.body
+    if type(outer).__name__ == "StridedLoop"
+    for inner in outer.body
+    if type(inner).__name__ == "Loop"
 )
 
 for name in sorted(axis_names):
@@ -904,13 +1225,62 @@ ptx_lines.append(f"    .reg .u64 %rd_base<{len(arg_order)}>;")
 ptx_lines.append(f"    .reg .u64 %rd_offset<{len(tile.body)}>;")
 ptx_lines.append(f"    .reg .u64 %rd_addr<{len(tile.body)}>;")
 ptx_lines.append(f"    .reg .f32 %f<{len(value_regs)}>;")
+if any(
+    type(op).__name__ == "CpAsyncCopy"
+    or (
+        type(op).__name__ == "StridedLoop"
+        and any(
+            type(inner).__name__ == "CpAsyncCopy"
+            for inner in op.body
+        )
+    )
+    for op in tile.body
+):
+    ptx_lines.append(
+        "    .reg .u32 %r_cp_base, %r_cp_offset, %r_cp_addr;"
+    )
+    ptx_lines.append(
+        "    .reg .u64 %rd_cp_offset, %rd_cp_addr;"
+    )
 ptx_lines.extend([
     "    mov.u32 %r_tid, %tid.x;",
     "    mov.u32 %r_bid, %ctaid.x;",
     "    mov.u32 %r_bdim, %ntid.x;"
 ])
+if len(tile.axes) == 4:
+    total = 1
 
-if len(tile.axes) == 2:
+    for a in tile.axes:
+        total *= a.extent.as_static()
+
+    ptx_lines.extend([
+        "    mad.lo.u32 %r_a0, %r_bid, %r_bdim, %r_tid;",
+        f"    setp.ge.u32 %p_out, %r_a0, {total};",
+        "    @%p_out bra DONE;"
+    ])
+
+    stride = total
+
+    for a in tile.axes:
+        extent = a.extent.as_static()
+        stride //= extent
+
+        if stride > 1:
+            ptx_lines.append(
+                f"    div.u32 %r_{a.name}, %r_a0, {stride};"
+            )
+
+            if stride * extent != total:
+                ptx_lines.append(
+                    f"    rem.u32 %r_{a.name}, %r_{a.name}, {extent};"
+                )
+        else:
+            ptx_lines.append(
+                f"    rem.u32 %r_{a.name}, %r_a0, {extent};"
+            )
+
+elif len(tile.axes) == 2:
+
     # r04: one block processes one matrix row
     ptx_lines.extend([
         "    mov.u32 %r_a0, %r_bid;",
@@ -918,6 +1288,7 @@ if len(tile.axes) == 2:
         f"    setp.ge.u32 %p_out, %r_a0, {axis.extent.as_static()};",
         "    @%p_out bra DONE;"
     ])
+
 else:
     # Preserve the mapping for our previous 1D problems
     ptx_lines.extend([
@@ -926,7 +1297,7 @@ else:
         "    @%p_out bra DONE;"
     ])
 
-if axis.name != "a0":
+if len(tile.axes) == 1 and axis.name != "a0":
     ptx_lines.append(
         f"    mov.u32 %r_{axis.name}, %r_a0;"
     )
