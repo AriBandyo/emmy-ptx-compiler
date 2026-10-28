@@ -58,3 +58,45 @@ def make_compiler_expr(instructions):
         raise TypeError(f"Unsupported expression: {kind}")
 
     return compiler_expr
+
+
+def buffer_shape(kernel_meta, name):
+    """Find a tensor's shape using kernel metadata."""
+    matches = [
+        arg["shape"]
+        for arg in kernel_meta["args"]
+        if arg["name"] == name
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Cannot resolve shape for {name}")
+    return matches[0]
+
+
+def flat_index(index_exprs, shape, compiler_expr, instructions):
+    """Convert row-major multidimensional indices into one offset."""
+    if not index_exprs:
+        if any(int(dim) != 1 for dim in shape):
+            raise ValueError("Missing indices for non-scalar tensor")
+        return "0"
+
+    # A single index can already represent a flat offset.
+    if len(index_exprs) == 1:
+        return compiler_expr(index_exprs[0])
+
+    if len(index_exprs) != len(shape):
+        raise ValueError(
+            f"Index rank {len(index_exprs)} does not match shape {shape}"
+        )
+
+    acc = compiler_expr(index_exprs[0])
+
+    for dimension in range(1, len(index_exprs)):
+        idx = compiler_expr(index_exprs[dimension])
+        dest = f"%r{len(instructions) + 1}"
+
+        instructions.append(
+            f"mad.lo.u32 {dest}, {acc}, {shape[dimension]}, {idx};"
+        )
+        acc = dest
+
+    return acc

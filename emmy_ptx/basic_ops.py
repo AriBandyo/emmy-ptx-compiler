@@ -1,3 +1,4 @@
+from emmy_ptx.expressions import buffer_shape, flat_index
 import sys
 from emmy_ptx.elementwise import emit_assign
 
@@ -9,44 +10,59 @@ def emit_basic_op(
     ptx_float_opcodes, arithmetic_instructions,
 ):
     if type(op).__name__ == "Load":
-        print("Load found at:", i, file=sys.stderr)
-        print("Variable:",op.names[0], file=sys.stderr)
-        print("Source",op.input, file=sys.stderr)
-        print("Index", op.index[0], file=sys.stderr)
-        value_regs[op.names[0]] = f"%f{len(value_regs)}"
+        if op.dtype.name != "f32":
+            raise NotImplementedError(
+                f"Unsupported load dtype: {op.dtype.name}"
+            )
+
+        width = len(op.names)
+        if width not in (1, 2, 4):
+            raise NotImplementedError(
+                f"Unsupported grouped load width: {width}"
+            )
+
         param_index = arg_order.index(op.input)
         start = len(instructions)
-        index_reg = compiler_expr(op.index[0])
+
+        index_reg = flat_index(
+            op.index,
+            buffer_shape(kernel_meta, op.input),
+            compiler_expr,
+            instructions,
+        )
 
         body_instructions.extend(instructions[start:])
 
-        print("Index operand:", index_reg, file=sys.stderr)
-        print(
-            "Parameter:", param_index,
-            "Register:", value_regs[op.names[0]],
-            file=sys.stderr
-        )
         offset_reg = f"%rd_offset{i}"
         addr_reg = f"%rd_addr{i}"
-        dest_reg = value_regs[op.names[0]]
+
         if index_reg == "0":
             body_instructions.append(
                 f"mov.u64 {offset_reg}, 0;"
             )
         else:
             body_instructions.append(
-                f"mul.wide.u32 {offset_reg}, {index_reg}, {op.dtype.nbytes};"
+                f"mul.wide.u32 {offset_reg}, "
+                f"{index_reg}, {op.dtype.nbytes};"
             )
 
-
-
         body_instructions.append(
-            f"add.u64 {addr_reg}, %rd_base{param_index}, {offset_reg};"
+            f"add.u64 {addr_reg}, "
+            f"%rd_base{param_index}, {offset_reg};"
         )
 
-        body_instructions.append(
-            f"ld.global.f32 {dest_reg}, [{addr_reg}];"
-        )
+        # Each destination receives one consecutive f32 value.
+        # Scalar loads avoid vector alignment requirements.
+        for j, name in enumerate(op.names):
+            dest_reg = f"%f{len(value_regs)}"
+            value_regs[name] = dest_reg
+
+            offset = "" if j == 0 else f"+{j * 4}"
+
+            body_instructions.append(
+                f"ld.global.f32 {dest_reg}, "
+                f"[{addr_reg}{offset}];"
+            )
 
     elif type(op).__name__ == "Assign":
         generated = emit_assign(op, value_regs)
@@ -56,7 +72,7 @@ def emit_basic_op(
     elif type(op).__name__ == "Write":
         print("Write found at:", i, file=sys.stderr)
         print("Output:", op.output, file=sys.stderr)
-        print("Index:", op.index[0], file=sys.stderr)
+        print("Index:", op.index, file=sys.stderr)
         print("Values:", op.values, file=sys.stderr)
         output_regs = [value_regs[name] for name in op.values]
 
