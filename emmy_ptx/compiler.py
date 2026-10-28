@@ -106,7 +106,7 @@ def compile_file(ir_filename):
     if os.environ.get("EMMY_SCHEDULE") == "1":
         operations = schedule_tile_operations(tile.body, tile.axes)
 
-    if os.environ.get("EMMY_VECTORIZE") == "1":
+    if os.environ.get("EMMY_VECTORIZE", "1") == "1":
         operations = vectorize_tile_operations(
             operations, tile.axes, kernel_meta
         )
