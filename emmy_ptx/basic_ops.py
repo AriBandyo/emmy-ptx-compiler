@@ -9,7 +9,7 @@ def emit_basic_op(
     compiler_expr, kernel_meta, arg_order,
     ptx_float_opcodes, arithmetic_instructions,
 ):
-    if type(op).__name__ == "Load":
+    if type(op).__name__ in ("Load", "VectorLoad"):
         if op.dtype.name != "f32":
             raise NotImplementedError(
                 f"Unsupported load dtype: {op.dtype.name}"
@@ -51,18 +51,32 @@ def emit_basic_op(
             f"%rd_base{param_index}, {offset_reg};"
         )
 
-        # Each destination receives one consecutive f32 value.
-        # Scalar loads avoid vector alignment requirements.
-        for j, name in enumerate(op.names):
+        dest_regs = []
+
+        for name in op.names:
             dest_reg = f"%f{len(value_regs)}"
             value_regs[name] = dest_reg
+            dest_regs.append(dest_reg)
 
-            offset = "" if j == 0 else f"+{j * 4}"
+        if type(op).__name__ == "VectorLoad":
+            if len(dest_regs) != 4:
+                raise ValueError("VectorLoad requires four values")
+
+            regs = ", ".join(dest_regs)
 
             body_instructions.append(
-                f"ld.global.f32 {dest_reg}, "
-                f"[{addr_reg}{offset}];"
+                f"ld.global.v4.f32 {{{regs}}}, [{addr_reg}];"
             )
+
+        else:
+            # Scalar fallback for ordinary Emmy Load nodes.
+            for j, dest_reg in enumerate(dest_regs):
+                offset = "" if j == 0 else f"+{j * 4}"
+
+                body_instructions.append(
+                    f"ld.global.f32 {dest_reg}, "
+                    f"[{addr_reg}{offset}];"
+                )
 
     elif type(op).__name__ == "Assign":
         generated = emit_assign(op, value_regs)

@@ -7,6 +7,7 @@ def compile_file(ir_filename):
     from emmy.compiler.graph import Graph
     from emmy_ptx.ptx import build_ptx
     from emmy_ptx.scheduler import schedule_tile_operations
+    from emmy_ptx.vectorize import vectorize_tile_operations
     from emmy_ptx.conditional_ops import emit_cond
     from emmy_ptx.memory_ops import emit_smem, emit_sync
     from emmy_ptx.basic_ops import emit_basic_op
@@ -105,6 +106,11 @@ def compile_file(ir_filename):
     if os.environ.get("EMMY_SCHEDULE") == "1":
         operations = schedule_tile_operations(tile.body, tile.axes)
 
+    if os.environ.get("EMMY_VECTORIZE") == "1":
+        operations = vectorize_tile_operations(
+            operations, tile.axes, kernel_meta
+        )
+
     for i, op in operations:
 
     
@@ -142,7 +148,7 @@ def compile_file(ir_filename):
                 emit_cp_async=emit_cp_async,
             )
 
-        elif type(op).__name__ in ("Load", "Assign", "Write"):
+        elif type(op).__name__ in ("Load", "Assign", "Write", "VectorLoad"):
             emit_basic_op(
                 op, i,
                 value_regs=value_regs,
