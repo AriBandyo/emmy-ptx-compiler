@@ -1,4 +1,5 @@
 from emmy_ptx.elementwise import emit_assign
+from emmy_ptx.conditional_generic import emit_generic_cond
 def emit_cond(
     op, i, *, tile, value_regs, instructions,
     body_instructions, compiler_expr, arg_order, kernel_meta
@@ -6,7 +7,8 @@ def emit_cond(
     cond = op.cond
 
     if (
-        cond.op == "=="
+        not op.else_body
+        and cond.op == "=="
         and getattr(cond.left, "name", None) == "lane"
         and getattr(cond.right, "value", None) == 0
     ):
@@ -47,7 +49,8 @@ def emit_cond(
         body_instructions.append(f"COND_END_{i}:")
 
     elif (
-        cond.op == "=="
+        not op.else_body
+        and cond.op == "=="
         and getattr(cond.left, "name", None) in {a.name for a in tile.axes}
         and getattr(cond.right, "value", None) == 0
     ):
@@ -126,6 +129,13 @@ def emit_cond(
         body_instructions.append(f"COND_END_{i}:")
 
     else:
-        raise NotImplementedError(
-            f"Unsupported condition: {cond}"
+        emit_generic_cond(
+            op, i,
+            tile=tile,
+            value_regs=value_regs,
+            instructions=instructions,
+            body_instructions=body_instructions,
+            compiler_expr=compiler_expr,
+            arg_order=arg_order,
+            kernel_meta=kernel_meta,
         )
