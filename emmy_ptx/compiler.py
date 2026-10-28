@@ -1,10 +1,12 @@
 def compile_file(ir_filename):
     import json
+    import os
     import sys
     import struct
     from pathlib import Path
     from emmy.compiler.graph import Graph
     from emmy_ptx.ptx import build_ptx
+    from emmy_ptx.scheduler import schedule_tile_operations
     from emmy_ptx.conditional_ops import emit_cond
     from emmy_ptx.memory_ops import emit_smem, emit_sync
     from emmy_ptx.basic_ops import emit_basic_op
@@ -98,7 +100,11 @@ def compile_file(ir_filename):
         ptx_float_opcodes
     )
 
-    for i, op in enumerate(tile.body):
+    operations = list(enumerate(tile.body))
+    if os.environ.get("EMMY_SCHEDULE") == "1":
+        operations = schedule_tile_operations(tile.body, tile.axes)
+
+    for i, op in operations:
 
     
         arg_order = kernel_meta["arg_order"]
