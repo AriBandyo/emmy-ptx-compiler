@@ -1,3 +1,4 @@
+from emmy_ptx.elementwise import emit_assign
 import struct
 
 def make_emit_regular_loop(body_instructions, value_regs, instructions, compiler_expr, kernel_meta, arg_order, ptx_float_opcodes):
@@ -118,36 +119,10 @@ def make_emit_regular_loop(body_instructions, value_regs, instructions, compiler
 
         
             elif type(stmt).__name__ == "Assign":
+                body_instructions.extend(
+                    emit_assign(stmt, value_regs)
+                )
 
-                op_name = stmt.op.name
-
-                dest_reg = f"%f{len(value_regs)}"
-                value_regs[stmt.name] = dest_reg
-
-                if op_name == "exp":
-
-                    src_reg = value_regs[stmt.args[0]]
-
-                    body_instructions.extend([
-                        f"mul.f32 {dest_reg}, {src_reg}, 0f3FB8AA3B;",
-                        f"ex2.approx.f32 {dest_reg}, {dest_reg};"
-                    ])
-
-                elif op_name in ptx_float_opcodes:
-
-                    left_reg = value_regs[stmt.args[0]]
-                    right_reg = value_regs[stmt.args[1]]
-
-                    opcode = ptx_float_opcodes[op_name]
-
-                    body_instructions.append(
-                        f"{opcode} {dest_reg}, {left_reg}, {right_reg};"
-                    )
-
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported regular loop operation: {op_name}"
-                    )
             elif type(stmt).__name__ == "Let":
 
                 if type(stmt.value).__name__ != "Literal":

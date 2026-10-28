@@ -1,4 +1,5 @@
 import sys
+from emmy_ptx.elementwise import emit_assign
 
 
 def emit_basic_op(
@@ -48,44 +49,10 @@ def emit_basic_op(
         )
 
     elif type(op).__name__ == "Assign":
-        print("Assign found at:", i, file=sys.stderr)
-        print("Result:", op.name, file=sys.stderr)
-        print("Operation:", op.op.name, file=sys.stderr)
-        print("Arguments:", op.args, file=sys.stderr)
-        value_regs[op.name] = f"%f{len(value_regs)}"
+        generated = emit_assign(op, value_regs)
+        arithmetic_instructions.extend(generated)
+        body_instructions.extend(generated)
 
-        #condition for ReLU or else  op.args[1] when ReLU is applied will faile 
-        dest_reg = value_regs[op.name]
-        if op.op.name == "relu":
-            src_reg = value_regs[op.args[0]]
-            instruction = (
-                f"max.f32 {dest_reg}, {src_reg},0f00000000;"
-            )
-        elif op.op.name in ("reciprocal", "sqrt"):
-            src_reg = value_regs[op.args[0]]
-
-            unary_opcodes = {
-                "reciprocal": "rcp.rn.f32",
-                "sqrt": "sqrt.rn.f32"
-            }
-
-            opcode = unary_opcodes[op.op.name]
-
-            instruction = (
-                f"{opcode} {dest_reg}, {src_reg};"
-            )
-        else:
-
-            left_reg = value_regs[op.args[0]]
-            right_reg = value_regs[op.args[1]]
-            ptx_opcode = ptx_float_opcodes[op.op.name]
-            instruction = (
-                f"{ptx_opcode} {dest_reg}, "
-                f"{left_reg}, {right_reg};"
-            )
-        print("Generated PTX:", instruction, file=sys.stderr)
-        arithmetic_instructions.append(instruction)
-        body_instructions.append(instruction)
     elif type(op).__name__ == "Write":
         print("Write found at:", i, file=sys.stderr)
         print("Output:", op.output, file=sys.stderr)

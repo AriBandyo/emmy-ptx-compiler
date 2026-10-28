@@ -1,3 +1,4 @@
+from emmy_ptx.elementwise import emit_assign
 def emit_cond(
     op, i, *, tile, value_regs, instructions,
     body_instructions, compiler_expr, arg_order, kernel_meta
@@ -78,20 +79,8 @@ def emit_cond(
                 )
 
             elif type(inner).__name__ == "Assign":
-                if inner.op.name != "divide":
-                    raise NotImplementedError(
-                        f"Unsupported operation: {inner.op.name}"
-                    )
-
-                dest_reg = f"%f{len(value_regs)}"
-                value_regs[inner.name] = dest_reg
-
-                left_reg = value_regs[inner.args[0]]
-                right_reg = value_regs[inner.args[1]]
-
-                body_instructions.append(
-                    f"div.rn.f32 {dest_reg}, "
-                    f"{left_reg}, {right_reg};"
+                body_instructions.extend(
+                    emit_assign(inner, value_regs)
                 )
 
             elif type(inner).__name__ == "Write":

@@ -1,3 +1,4 @@
+from emmy_ptx.elementwise import emit_assign
 import struct
 def emit_strided_loop(
     op, i, *,
@@ -107,39 +108,9 @@ def emit_strided_loop(
             ])
 
         elif type(inner).__name__ == "Assign":
-
-            op_name = inner.op.name
-
-            dest_reg = f"%f{len(value_regs)}"
-            value_regs[inner.name] = dest_reg
-
-            if op_name == "exp":
-
-                src_reg = value_regs[inner.args[0]]
-
-                body_instructions.extend([
-                    f"mul.f32 {dest_reg}, "
-                    f"{src_reg}, 0f3FB8AA3B;",
-
-                    f"ex2.approx.f32 {dest_reg}, {dest_reg};"
-                ])
-
-            else:
-
-                if op_name not in ptx_float_opcodes:
-                    raise NotImplementedError(
-                        f"Unsupported loop operation: {op_name}"
-                    )
-
-                left_reg = value_regs[inner.args[0]]
-                right_reg = value_regs[inner.args[1]]
-
-                opcode = ptx_float_opcodes[op_name]
-
-                body_instructions.append(
-                    f"{opcode} {dest_reg}, "
-                    f"{left_reg}, {right_reg};"
-                )
+            body_instructions.extend(
+                emit_assign(inner, value_regs)
+            )
 
         elif type(inner).__name__ == "Accum":
 
@@ -309,58 +280,9 @@ def emit_strided_loop(
                     ])
 
                 elif type(stmt).__name__ == "Assign":
-
-                    op_name = stmt.op.name
-
-                    dest_reg = f"%f{len(value_regs)}"
-                    value_regs[stmt.name] = dest_reg
-
-                    if op_name == "exp":
-
-                        src_reg = value_regs[stmt.args[0]]
-
-                        body_instructions.extend([
-                            f"mul.f32 {dest_reg}, {src_reg}, 0f3FB8AA3B;",
-                            f"ex2.approx.f32 {dest_reg}, {dest_reg};"
-                        ])
-
-                    elif op_name in ptx_float_opcodes:
-
-                        left_reg = value_regs[stmt.args[0]]
-                        right_reg = value_regs[stmt.args[1]]
-
-                        opcode = ptx_float_opcodes[op_name]
-
-                        body_instructions.append(
-                            f"{opcode} {dest_reg}, {left_reg}, {right_reg};"
-                        )
-
-                    elif type(stmt).__name__ == "Accum":
-
-                        acc_reg = value_regs[stmt.name]
-                        src_reg = value_regs[stmt.value]
-
-                        base_reg = (
-                            value_regs[stmt.base]
-                            if stmt.base is not None
-                            else acc_reg
-                        )
-
-                        accumulator_opcodes = {
-                            "add": "add.f32",
-                            "maximum": "max.f32"
-                        }
-
-                        if stmt.op.name not in accumulator_opcodes:
-                            raise NotImplementedError(
-                                f"Unsupported regular loop accumulator: {stmt.op.name}"
-                            )
-
-                        opcode = accumulator_opcodes[stmt.op.name]
-
-                        body_instructions.append(
-                            f"{opcode} {acc_reg}, {base_reg}, {src_reg};"
-                        )
+                    body_instructions.extend(
+                        emit_assign(stmt, value_regs)
+                    )
 
                 elif type(stmt).__name__ == "Accum":
 

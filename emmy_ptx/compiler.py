@@ -10,6 +10,7 @@ def compile_file(ir_filename):
     from emmy_ptx.conditional_ops import emit_cond
     from emmy_ptx.memory_ops import emit_smem, emit_sync
     from emmy_ptx.basic_ops import emit_basic_op
+    from emmy_ptx.elementwise import emit_assign
     from emmy_ptx.loop_ops import emit_strided_loop
 
 
@@ -183,48 +184,9 @@ def compile_file(ir_filename):
                     ])
 
                 for combine in op.combine_states:
-
-                    op_name = combine.op.name
-
-                    if combine.name not in value_regs:
-                        value_regs[combine.name] = f"%f{len(value_regs)}"
-
-                    dest_reg = value_regs[combine.name]
-
-                    if op_name == "copy":
-
-                        src_reg = value_regs[combine.args[0]]
-
-                        body_instructions.append(
-                            f"mov.f32 {dest_reg}, {src_reg};"
-                        )
-
-                    elif op_name == "exp":
-
-                        src_reg = value_regs[combine.args[0]]
-
-                        body_instructions.extend([
-                            f"mul.f32 {dest_reg}, "
-                            f"{src_reg}, 0f3FB8AA3B;",
-                            f"ex2.approx.f32 {dest_reg}, {dest_reg};"
-                        ])
-
-                    else:
-
-                        if op_name not in ptx_float_opcodes:
-                            raise NotImplementedError(
-                                f"Unsupported shuffle operation: {op_name}"
-                            )
-
-                        left_reg = value_regs[combine.args[0]]
-                        right_reg = value_regs[combine.args[1]]
-
-                        opcode = ptx_float_opcodes[op_name]
-
-                        body_instructions.append(
-                            f"{opcode} {dest_reg}, "
-                            f"{left_reg}, {right_reg};"
-                        )
+                    body_instructions.extend(
+                        emit_assign(combine, value_regs, fresh=False)
+                    )
 
                 offset //= 2
 
@@ -289,44 +251,9 @@ def compile_file(ir_filename):
                         ])
 
                     for combine in op.combine_states:
-
-                        op_name = combine.op.name
-
-                        if combine.name not in value_regs:
-                            value_regs[combine.name] = f"%f{len(value_regs)}"
-
-                        dest_reg = value_regs[combine.name]
-
-                        if op_name == "copy":
-                            src_reg = value_regs[combine.args[0]]
-
-                            body_instructions.append(
-                                f"mov.f32 {dest_reg}, {src_reg};"
-                            )
-
-                        elif op_name == "exp":
-                            src_reg = value_regs[combine.args[0]]
-
-                            body_instructions.extend([
-                                f"mul.f32 {dest_reg}, "
-                                f"{src_reg}, 0f3FB8AA3B;",
-                                f"ex2.approx.f32 {dest_reg}, {dest_reg};"
-                            ])
-
-                        else:
-                            if op_name not in ptx_float_opcodes:
-                                raise NotImplementedError(
-                                    f"Unsupported tree operation: {op_name}"
-                                )
-
-                            left_reg = value_regs[combine.args[0]]
-                            right_reg = value_regs[combine.args[1]]
-                            opcode = ptx_float_opcodes[op_name]
-
-                            body_instructions.append(
-                                f"{opcode} {dest_reg}, "
-                                f"{left_reg}, {right_reg};"
-                            )
+                        body_instructions.extend(
+                            emit_assign(combine, value_regs, fresh=False)
+                        )
 
                 for state_name, shared_name in zip(
                     op.state, op.bufs
@@ -368,11 +295,13 @@ def compile_file(ir_filename):
                 for k in range(1, op.length):
                     offset = k * 4
 
-                    body_instructions.extend([
-                        f"ld.shared.f32 {temp_reg}, "
-                        f"[%r_smem_base+{offset}];",
-                        f"add.f32 {acc_reg}, {acc_reg}, {temp_reg};"
-                    ])
+                    body_instructions.append(
+                        f"ld.shared.f32 {temp_reg}, [%r_smem_base+{offset}];"
+                    )
+                    for combine in op.combine_states:
+                        body_instructions.extend(
+                            emit_assign(combine, value_regs, fresh=False)
+                        )
 
                 needs_broadcast = any(
                     type(later).__name__ == "Assign"
